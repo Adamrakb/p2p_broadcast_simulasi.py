@@ -1,11 +1,10 @@
-# Versi Otomatis dengan Auto-Discovery & Web GUI (Flask)
+# Versi dengan Hasil Pencarian Langsung dan Recheck
 
-from flask import Flask, request, render_template_string, redirect, send_from_directory
-import os, threading, socket, json
+from flask import Flask, request, render_template_string, redirect, send_from_directory, url_for
+import os, threading, socket, json, time
 
 app = Flask(__name__)
 
-# Konfigurasi peer
 HOSTNAME = socket.gethostbyname(socket.gethostname())
 PORT = 5000
 PEER_PORT = 6000
@@ -14,10 +13,11 @@ PEERS = set()
 FILES = set()
 TTL = 4
 
+search_results = {}
+
 if not os.path.exists(SHARE_DIR):
     os.makedirs(SHARE_DIR)
 
-# HTML template sederhana
 HTML = '''
 <h1>Peer-to-Peer Node @ {{host}}</h1>
 <form method="post" enctype="multipart/form-data" action="/upload">
@@ -36,11 +36,20 @@ HTML = '''
   <li><a href="/download/{{f}}">{{f}}</a></li>
 {% endfor %}
 </ul>
+
+<h2>Search Results:</h2>
+<ul>
+{% for f, info in results.items() %}
+  <li><strong>{{f}}</strong> found at {{info['host']}}:<a href="http://{{info['host']}}:5000/download/{{f}}">Download</a></li>
+{% else %}
+  <li>No results yet. <a href="/recheck">Recheck</a></li>
+{% endfor %}
+</ul>
 '''
 
 @app.route('/')
 def home():
-    return render_template_string(HTML, files=os.listdir(SHARE_DIR), host=HOSTNAME)
+    return render_template_string(HTML, files=os.listdir(SHARE_DIR), host=HOSTNAME, results=search_results)
 
 @app.route('/upload', methods=['POST'])
 def upload():
@@ -53,24 +62,29 @@ def upload():
 @app.route('/search')
 def search():
     filename = request.args.get('filename')
+    if not filename:
+        return redirect('/')
     if filename in os.listdir(SHARE_DIR):
-        return f"File '{filename}' is available locally. <a href='/download/{filename}'>Download</a>"
+        search_results[filename] = {"host": HOSTNAME}
     else:
+        search_results[filename] = None
         broadcast_search(filename, TTL)
-        return f"Searching for '{filename}' in the network..."
+    return redirect('/')
+
+@app.route('/recheck')
+def recheck():
+    return redirect('/')
 
 @app.route('/download/<filename>')
 def download(filename):
     return send_from_directory(SHARE_DIR, filename)
 
-# Peer-to-peer listener and broadcast
+# PEER LISTENER
 
 def peer_listener():
     s = socket.socket()
     s.bind((HOSTNAME, PEER_PORT))
     s.listen()
-    print(f"[PEER] Listening on {HOSTNAME}:{PEER_PORT}")
-
     while True:
         conn, addr = s.accept()
         data = conn.recv(1024).decode()
@@ -78,32 +92,42 @@ def peer_listener():
             message = json.loads(data)
             if message['type'] == 'SEARCH':
                 handle_search(message, addr)
+            elif message['type'] == 'FOUND':
+                search_results[message['filename']] = {"host": message['host']}
         except:
             pass
         conn.close()
 
-def broadcast_search(filename, ttl):
-    for peer in PEERS:
-        try:
-            s = socket.socket()
-            s.connect((peer, PEER_PORT))
-            message = json.dumps({"type": "SEARCH", "filename": filename, "ttl": ttl})
-            s.send(message.encode())
-            s.close()
-        except:
-            continue
+# HANDLE SEARCH AND BROADCAST
 
 def handle_search(message, addr):
     filename = message['filename']
     ttl = message['ttl']
 
     if filename in os.listdir(SHARE_DIR):
-        print(f"[FOUND] {filename} found at {HOSTNAME}:{PEER_PORT}")
-        return
+        reply = json.dumps({"type": "FOUND", "filename": filename, "host": HOSTNAME})
+        try:
+            s = socket.socket()
+            s.connect((addr[0], PEER_PORT))
+            s.send(reply.encode())
+            s.close()
+        except:
+            pass
     elif ttl > 1:
         broadcast_search(filename, ttl - 1)
 
-# Auto-discovery broadcast
+def broadcast_search(filename, ttl):
+    for peer in PEERS:
+        try:
+            s = socket.socket()
+            s.connect((peer, PEER_PORT))
+            msg = json.dumps({"type": "SEARCH", "filename": filename, "ttl": ttl})
+            s.send(msg.encode())
+            s.close()
+        except:
+            continue
+
+# DISCOVERY
 
 def discover_peers():
     udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
