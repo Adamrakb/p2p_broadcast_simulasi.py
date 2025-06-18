@@ -4,10 +4,11 @@ import threading
 import socket
 import json
 import time
+import random 
 
 app = Flask(__name__)
 
-HOST_IP = '0.0.0.0' 
+HOST_IP = '0.0.0.0'
 WEB_PORT = 5000
 PEER_PORT = 6000
 DISCOVERY_PORT = 6001
@@ -21,6 +22,7 @@ search_results = {}
 
 peers_lock = threading.Lock()
 results_lock = threading.Lock()
+
 
 TTL = 4
 
@@ -42,11 +44,13 @@ HTML = '''
         input[type="file"], input[type="text"] { border: 1px solid #ccc; padding: 8px; width: 70%; border-radius: 4px; }
         button { background-color: #007bff; color: white; padding: 10px 15px; border: none; border-radius: 4px; cursor: pointer; }
         button:hover { background-color: #0056b3; }
+        .peer-list { font-size: 0.9em; color: #555; }
     </style>
 </head>
 <body>
     <h1>Peer-to-Peer Node</h1>
     <p>Alamat IP Anda di jaringan ini mungkin: <strong>{{host_ip}}</strong></p>
+    <p class="peer-list">Peer yang Terdeteksi: {{peers}}</p>
 
     <h2>Upload File</h2>
     <form method="post" enctype="multipart/form-data" action="/upload">
@@ -70,7 +74,7 @@ HTML = '''
     </ul>
 
     <h2>Hasil Pencarian:</h2>
-    <p><a href="/recheck">Refresh Hasil Pencarian</a></p>
+    <p><a href="/">Refresh Halaman & Hasil</a></p>
     <ul>
     {% for f, info in results.items() %}
       <li><strong>{{f}}</strong> ditemukan di {{info['host']}}:<a href="http://{{info['host']}}:{{web_port}}/download/{{f}}" target="_blank"> Download</a></li>
@@ -94,8 +98,11 @@ def home():
         s.close()
     
     with results_lock:
-        current_results = dict(search_results) 
-    return render_template_string(HTML, files=os.listdir(SHARE_DIR), host_ip=local_ip, results=current_results, web_port=WEB_PORT)
+        current_results = dict(search_results)
+    with peers_lock:
+        current_peers = list(PEERS)
+        
+    return render_template_string(HTML, files=os.listdir(SHARE_DIR), host_ip=local_ip, results=current_results, peers=current_peers, web_port=WEB_PORT)
 
 @app.route('/upload', methods=['POST'])
 def upload():
@@ -128,20 +135,15 @@ def search():
     time.sleep(1) 
     return redirect(url_for('home'))
 
-@app.route('/recheck')
-def recheck():
-    return redirect(url_for('home'))
-
 @app.route('/download/<filename>')
 def download(filename):
     return send_from_directory(SHARE_DIR, filename, as_attachment=True)
 
 
 def peer_listener():
-    """Mendengarkan pesan masuk dari peer lain (SEARCH, FOUND)."""
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.bind((HOST_IP, PEER_PORT))
-    s.listen()
+    s.listen(5)
     print(f"[*] Peer listener berjalan di port {PEER_PORT}")
     while True:
         conn, addr = s.accept()
@@ -161,7 +163,6 @@ def peer_listener():
             conn.close()
 
 def handle_search_request(message, origin_ip):
-    """Memproses pesan SEARCH yang diterima."""
     filename = message['filename']
     ttl = message['ttl']
 
@@ -190,7 +191,6 @@ def handle_search_request(message, origin_ip):
         broadcast_search(filename, ttl - 1, origin_ip=origin_ip)
 
 def broadcast_search(filename, ttl, origin_ip=None):
-    """Mengirim pesan SEARCH ke semua peer yang diketahui."""
     if origin_ip is None:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
@@ -203,7 +203,7 @@ def broadcast_search(filename, ttl, origin_ip=None):
     
     print(f"[*] Melakukan broadcast pencarian untuk '{filename}'...")
     with peers_lock:
-        peers_to_search = list(PEERS) 
+        peers_to_search = list(PEERS)
     
     msg = json.dumps({"type": "SEARCH", "filename": filename, "ttl": ttl, "origin_ip": origin_ip})
     for peer_ip in peers_to_search:
@@ -211,7 +211,7 @@ def broadcast_search(filename, ttl, origin_ip=None):
             continue
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(1) 
+            s.settimeout(1)
             s.connect((peer_ip, PEER_PORT))
             s.send(msg.encode())
             s.close()
@@ -220,29 +220,30 @@ def broadcast_search(filename, ttl, origin_ip=None):
 
 
 def discover_peers():
-    """PERBAIKAN: Secara periodik mengirim pesan broadcast untuk menemukan peer."""
+    """PERBAIKAN FINAL: Mengirim broadcast lebih sering dan acak untuk keandalan maksimal."""
     while True:
         print("[*] Mengirim discovery broadcast...")
         udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         udp.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         udp.sendto(b'DISCOVER_P2P_FILE_SHARING', ('<broadcast>', DISCOVERY_PORT))
         udp.close()
-        time.sleep(15)  
+        
+        sleep_interval = random.uniform(5, 10) 
+        time.sleep(sleep_interval)
 
 def peer_discovery_listener():
-    """Mendengarkan broadcast discovery dan menambahkan peer baru."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.bind((HOST_IP, DISCOVERY_PORT))
     print(f"[*] Discovery listener berjalan di port {DISCOVERY_PORT}")
     
-    s_local_ip = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    my_ip = '127.0.0.1'
     try:
+        s_local_ip = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s_local_ip.connect(('8.8.8.8', 1))
         my_ip = s_local_ip.getsockname()[0]
-    except Exception:
-        my_ip = '127.0.0.1'
-    finally:
         s_local_ip.close()
+    except Exception:
+        pass
         
     while True:
         data, addr = s.recvfrom(1024)
@@ -251,14 +252,12 @@ def peer_discovery_listener():
                 if addr[0] not in PEERS:
                     print(f"[*] Peer baru ditemukan: {addr[0]}")
                     PEERS.add(addr[0])
-            print(f"[*] Daftar peer saat ini: {PEERS}")
 
 
 if __name__ == '__main__':
     print("--- Memulai Aplikasi P2P File Sharing ---")
     
     threading.Thread(target=peer_listener, daemon=True).start()
-    
     threading.Thread(target=peer_discovery_listener, daemon=True).start()
     
     time.sleep(1) 
@@ -266,4 +265,4 @@ if __name__ == '__main__':
     threading.Thread(target=discover_peers, daemon=True).start()
     
     print(f"[*] Web server berjalan. Buka http://<alamat-ip-anda>:{WEB_PORT} di browser.")
-    app.run(host=HOST_IP, port=WEB_PORT)
+    app.run(host=HOST_IP, port=WEB_PORT, debug=False)
