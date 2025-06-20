@@ -4,27 +4,23 @@ import threading
 import socket
 import json
 import time
-import random 
 
 app = Flask(__name__)
 
-HOST_IP = '0.0.0.0'
+HOST_IP = '0.0.0.0' 
 WEB_PORT = 5000
 PEER_PORT = 6000
 DISCOVERY_PORT = 6001
-
 SHARE_DIR = f'shared_{WEB_PORT}'
+TTL = 4
+
 if not os.path.exists(SHARE_DIR):
     os.makedirs(SHARE_DIR)
 
 PEERS = set()
 search_results = {}
-
 peers_lock = threading.Lock()
 results_lock = threading.Lock()
-
-
-TTL = 4
 
 HTML = '''
 <!DOCTYPE html>
@@ -44,13 +40,11 @@ HTML = '''
         input[type="file"], input[type="text"] { border: 1px solid #ccc; padding: 8px; width: 70%; border-radius: 4px; }
         button { background-color: #007bff; color: white; padding: 10px 15px; border: none; border-radius: 4px; cursor: pointer; }
         button:hover { background-color: #0056b3; }
-        .peer-list { font-size: 0.9em; color: #555; }
     </style>
 </head>
 <body>
     <h1>Peer-to-Peer Node</h1>
     <p>Alamat IP Anda di jaringan ini mungkin: <strong>{{host_ip}}</strong></p>
-    <p class="peer-list">Peer yang Terdeteksi: {{peers}}</p>
 
     <h2>Upload File</h2>
     <form method="post" enctype="multipart/form-data" action="/upload">
@@ -74,7 +68,7 @@ HTML = '''
     </ul>
 
     <h2>Hasil Pencarian:</h2>
-    <p><a href="/">Refresh Halaman & Hasil</a></p>
+    <p><a href="/recheck">Refresh Hasil Pencarian</a></p>
     <ul>
     {% for f, info in results.items() %}
       <li><strong>{{f}}</strong> ditemukan di {{info['host']}}:<a href="http://{{info['host']}}:{{web_port}}/download/{{f}}" target="_blank"> Download</a></li>
@@ -86,30 +80,19 @@ HTML = '''
 </html>
 '''
 
+
 @app.route('/')
 def home():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(('8.8.8.8', 1))
-        local_ip = s.getsockname()[0]
-    except Exception:
-        local_ip = '127.0.0.1'
-    finally:
-        s.close()
-    
+    my_ip = get_my_ip()
     with results_lock:
         current_results = dict(search_results)
-    with peers_lock:
-        current_peers = list(PEERS)
-        
-    return render_template_string(HTML, files=os.listdir(SHARE_DIR), host_ip=local_ip, results=current_results, peers=current_peers, web_port=WEB_PORT)
+    return render_template_string(HTML, files=os.listdir(SHARE_DIR), host_ip=my_ip, results=current_results, web_port=WEB_PORT)
 
 @app.route('/upload', methods=['POST'])
 def upload():
     if 'file' in request.files:
         f = request.files['file']
-        path = os.path.join(SHARE_DIR, f.filename)
-        f.save(path)
+        f.save(os.path.join(SHARE_DIR, f.filename))
     return redirect('/')
 
 @app.route('/search')
@@ -120,15 +103,7 @@ def search():
     
     if filename in os.listdir(SHARE_DIR):
         with results_lock:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            try:
-                s.connect(('8.8.8.8', 1))
-                local_ip = s.getsockname()[0]
-            except Exception:
-                local_ip = '127.0.0.1'
-            finally:
-                s.close()
-            search_results[filename] = {"host": local_ip}
+            search_results[filename] = {"host": get_my_ip()}
     else:
         broadcast_search(filename, TTL)
     
@@ -143,63 +118,57 @@ def download(filename):
 def peer_listener():
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.bind((HOST_IP, PEER_PORT))
-    s.listen(5)
+    s.listen(10)
     print(f"[*] Peer listener berjalan di port {PEER_PORT}")
     while True:
-        conn, addr = s.accept()
         try:
-            data = conn.recv(1024).decode()
-            message = json.loads(data)
-            print(f"[*] Pesan diterima dari {addr[0]}: {message}")
-
-            if message['type'] == 'SEARCH':
-                handle_search_request(message, message['origin_ip'])
-            elif message['type'] == 'FOUND':
-                with results_lock:
-                    search_results[message['filename']] = {"host": message['host']}
+            conn, addr = s.accept()
+            threading.Thread(target=handle_peer_connection, args=(conn, addr)).start()
         except Exception as e:
-            print(f"[!] Error saat memproses pesan: {e}")
-        finally:
-            conn.close()
+            print(f"[!] Error di listener utama: {e}")
 
-def handle_search_request(message, origin_ip):
+def handle_peer_connection(conn, addr):
+    try:
+        data = conn.recv(1024).decode()
+        message = json.loads(data)
+        print(f"[*] Pesan diterima dari {addr[0]}: Tipe '{message.get('type')}'")
+
+        msg_type = message.get('type')
+        if msg_type == 'SEARCH':
+            handle_search_request(message)
+        elif msg_type == 'FOUND':
+            with results_lock:
+                search_results[message['filename']] = {"host": message['host']}
+        
+        elif msg_type == 'SYNC_PEERS':
+            received_peers = set(message.get('peers', []))
+            with peers_lock:
+                newly_discovered = received_peers - PEERS - {get_my_ip()}
+                if newly_discovered:
+                    print(f"[*] Menemukan {len(newly_discovered)} peer baru via gossip: {newly_discovered}")
+                    PEERS.update(newly_discovered)
+
+    except Exception as e:
+        print(f"[!] Error saat memproses pesan: {e}")
+    finally:
+        conn.close()
+
+def handle_search_request(message):
     filename = message['filename']
     ttl = message['ttl']
+    origin_ip = message['origin_ip']
 
     if filename in os.listdir(SHARE_DIR):
         print(f"[*] File '{filename}' ditemukan, mengirim balasan ke {origin_ip}")
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            try:
-                s.connect(('8.8.8.8', 1))
-                local_ip = s.getsockname()[0]
-            except Exception:
-                local_ip = '127.0.0.1'
-            finally:
-                s.close()
-
-            reply = json.dumps({"type": "FOUND", "filename": filename, "host": local_ip})
-            s_reply = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s_reply.connect((origin_ip, PEER_PORT))
-            s_reply.send(reply.encode())
-            s_reply.close()
-        except Exception as e:
-            print(f"[!] Gagal mengirim balasan FOUND: {e}")
-    
+        reply = json.dumps({"type": "FOUND", "filename": filename, "host": get_my_ip()})
+        send_tcp_message(origin_ip, PEER_PORT, reply)
     elif ttl > 1:
         print(f"[*] File '{filename}' tidak ditemukan, meneruskan pencarian (TTL: {ttl-1})")
         broadcast_search(filename, ttl - 1, origin_ip=origin_ip)
 
 def broadcast_search(filename, ttl, origin_ip=None):
     if origin_ip is None:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            s.connect(('8.8.8.8', 1))
-            origin_ip = s.getsockname()[0]
-        except Exception:
-            origin_ip = '127.0.0.1'
-        finally:
-            s.close()
+        origin_ip = get_my_ip()
     
     print(f"[*] Melakukan broadcast pencarian untuk '{filename}'...")
     with peers_lock:
@@ -207,62 +176,86 @@ def broadcast_search(filename, ttl, origin_ip=None):
     
     msg = json.dumps({"type": "SEARCH", "filename": filename, "ttl": ttl, "origin_ip": origin_ip})
     for peer_ip in peers_to_search:
-        if peer_ip == origin_ip:
-            continue
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(1)
-            s.connect((peer_ip, PEER_PORT))
-            s.send(msg.encode())
-            s.close()
-        except Exception as e:
-            print(f"[!] Tidak dapat terhubung ke peer {peer_ip}: {e}")
+        if peer_ip != origin_ip:
+            send_tcp_message(peer_ip, PEER_PORT, msg)
 
-
-def discover_peers():
-    """PERBAIKAN FINAL: Mengirim broadcast lebih sering dan acak untuk keandalan maksimal."""
-    while True:
-        print("[*] Mengirim discovery broadcast...")
-        udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-        udp.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        udp.sendto(b'DISCOVER_P2P_FILE_SHARING', ('<broadcast>', DISCOVERY_PORT))
-        udp.close()
-        
-        sleep_interval = random.uniform(5, 10) 
-        time.sleep(sleep_interval)
 
 def peer_discovery_listener():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.bind((HOST_IP, DISCOVERY_PORT))
-    print(f"[*] Discovery listener berjalan di port {DISCOVERY_PORT}")
-    
-    my_ip = '127.0.0.1'
-    try:
-        s_local_ip = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s_local_ip.connect(('8.8.8.8', 1))
-        my_ip = s_local_ip.getsockname()[0]
-        s_local_ip.close()
-    except Exception:
-        pass
+    print(f"[*] Discovery listener (broadcast) berjalan di port {DISCOVERY_PORT}")
+    my_ip = get_my_ip()
         
     while True:
-        data, addr = s.recvfrom(1024)
-        if data == b'DISCOVER_P2P_FILE_SHARING' and addr[0] != my_ip:
-            with peers_lock:
-                if addr[0] not in PEERS:
-                    print(f"[*] Peer baru ditemukan: {addr[0]}")
-                    PEERS.add(addr[0])
+        try:
+            data, addr = s.recvfrom(1024)
+            peer_ip = addr[0]
+            if data == b'DISCOVER_P2P_NODE' and peer_ip != my_ip:
+                with peers_lock:
+                    is_new_peer = peer_ip not in PEERS
+                    if is_new_peer:
+                        print(f"[*] Peer baru ditemukan via broadcast: {peer_ip}")
+                        PEERS.add(peer_ip)
+                
+                if is_new_peer:
+                    print(f"[*] Memulai gossip dengan {peer_ip}, mengirim daftar peer kita...")
+                    send_my_peer_list(peer_ip)
+
+        except Exception as e:
+            print(f"[!] Error di discovery listener: {e}")
+
+def send_my_peer_list(recipient_ip):
+    with peers_lock:
+        peer_list_to_send = list(PEERS | {get_my_ip()})
+    
+    message = json.dumps({'type': 'SYNC_PEERS', 'peers': peer_list_to_send})
+    send_tcp_message(recipient_ip, PEER_PORT, message)
+
+def discover_peers_periodically():
+    while True:
+        print("[*] Mengirim discovery broadcast...")
+        udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        udp.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        udp.sendto(b'DISCOVER_P2P_NODE', ('<broadcast>', DISCOVERY_PORT))
+        udp.close()
+        
+        with peers_lock:
+            if PEERS:
+                print(f"[*] Daftar peer saat ini: {PEERS}")
+
+        time.sleep(10)
+
+
+def get_my_ip():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(('8.8.8.8', 80))
+        ip = s.getsockname()[0]
+    except Exception:
+        ip = '127.0.0.1'
+    finally:
+        s.close()
+    return ip
+
+def send_tcp_message(ip, port, message):
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(2)
+        s.connect((ip, port))
+        s.send(message.encode())
+    except Exception as e:
+        print(f"[!] Gagal mengirim pesan TCP ke {ip}:{port} - {e}")
+    finally:
+        s.close()
 
 
 if __name__ == '__main__':
-    print("--- Memulai Aplikasi P2P File Sharing ---")
+    print("--- Memulai Aplikasi P2P File Sharing dengan Arsitektur Gossip ---")
     
     threading.Thread(target=peer_listener, daemon=True).start()
     threading.Thread(target=peer_discovery_listener, daemon=True).start()
-    
     time.sleep(1) 
+    threading.Thread(target=discover_peers_periodically, daemon=True).start()
     
-    threading.Thread(target=discover_peers, daemon=True).start()
-    
-    print(f"[*] Web server berjalan. Buka http://<alamat-ip-anda>:{WEB_PORT} di browser.")
+    print(f"[*] Web server berjalan. Buka http://{get_my_ip()}:{WEB_PORT} di browser.")
     app.run(host=HOST_IP, port=WEB_PORT, debug=False)
