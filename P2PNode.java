@@ -124,7 +124,6 @@ public class P2PNode {
                     String messageStr = new String(packet.getData(), 0, packet.getLength(), StandardCharsets.UTF_8);
                     JSONObject message = new JSONObject(messageStr);
                     if ("SEARCH".equals(message.optString("type"))) {
-                        logMessage("Menerima broadcast SEARCH untuk '" + message.getString("filename") + "' dari " + senderIp);
                         handleSearchRequest(message);
                     }
                 } catch (Exception e) {
@@ -180,7 +179,6 @@ public class P2PNode {
         File file = new File(SHARE_DIR, filename);
 
         if (file.exists()) {
-            logMessage("File '" + filename + "' ditemukan lokal, mengirim balasan ke " + originIp);
             try {
                 JSONObject reply = new JSONObject();
                 reply.put("type", "FOUND");
@@ -222,6 +220,7 @@ public class P2PNode {
         File[] files = dir.listFiles();
         StringBuilder fileListHtml = new StringBuilder();
         if (files != null) {
+            Arrays.sort(files, Comparator.comparingLong(File::lastModified).reversed());
             for (File file : files) {
                 fileListHtml.append("<li>").append(file.getName()).append("</li>");
             }
@@ -229,7 +228,10 @@ public class P2PNode {
         if (fileListHtml.length() == 0) fileListHtml.append("<li>Belum ada file.</li>");
 
         StringBuilder searchResultHtml = new StringBuilder();
-        for (JSONObject result : searchResults.values()) {
+        List<JSONObject> sortedResults = new ArrayList<>(searchResults.values());
+        sortedResults.sort(Comparator.comparing(o -> o.getString("filename")));
+
+        for (JSONObject result : sortedResults) {
             String filename = result.getString("filename");
             String host = result.getString("host");
             searchResultHtml.append(String.format(
@@ -249,8 +251,93 @@ public class P2PNode {
     }
 
     private static void handleUploadRequest(HttpExchange exchange) throws IOException {
-        String responseBody = "Fitur upload file yang sebenarnya kompleks dan membutuhkan pustaka tambahan. Untuk proyek ini, letakkan file secara manual di folder '" + SHARE_DIR + "'.";
-        sendHttpResponse(exchange, 200, "text/plain", responseBody);
+        if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
+            sendHttpResponse(exchange, 405, "text/plain", "Method Not Allowed");
+            return;
+        }
+
+        String filename = null;
+        try {
+            String contentType = exchange.getRequestHeaders().getFirst("Content-Type");
+            String boundary = "--" + contentType.split("boundary=")[1];
+            byte[] boundaryBytes = boundary.getBytes(StandardCharsets.UTF_8);
+
+            InputStream in = exchange.getRequestBody();
+            byte[] data = in.readAllBytes();
+            
+            int partStartIndex = indexOf(data, boundaryBytes, 0);
+            if(partStartIndex == -1) throw new IOException("Boundary tidak ditemukan");
+            
+            String headers = getHeaders(data, partStartIndex);
+            filename = getFilenameFromHeaders(headers);
+            if (filename == null || filename.isEmpty()) throw new IOException("Nama file tidak ditemukan di header");
+
+            filename = Paths.get(filename).getFileName().toString();
+
+            int fileDataStartIndex = findBodyStart(data, partStartIndex) + 4;
+
+            int nextPartStartIndex = indexOf(data, boundaryBytes, fileDataStartIndex);
+            int fileDataEndIndex = (nextPartStartIndex == -1) ? data.length : nextPartStartIndex;
+            
+            if (fileDataEndIndex > 2 && data[fileDataEndIndex - 2] == '\r' && data[fileDataEndIndex - 1] == '\n') {
+                fileDataEndIndex -= 2;
+            }
+
+            File outputFile = new File(SHARE_DIR, filename);
+            try (FileOutputStream fos = new FileOutputStream(outputFile)) {
+                fos.write(data, fileDataStartIndex, fileDataEndIndex - fileDataStartIndex);
+            }
+            logMessage("File '" + filename + "' berhasil di-upload dari web.");
+
+        } catch (Exception e) {
+            logMessage("[ERROR] Gagal saat memproses upload: " + e.getMessage());
+            e.printStackTrace();
+        } finally {
+            exchange.getResponseHeaders().set("Location", "/");
+            exchange.sendResponseHeaders(302, -1);
+        }
+    }
+
+    private static String getHeaders(byte[] data, int partStartIndex) {
+        byte[] separator = new byte[]{13, 10, 13, 10}; 
+        int headerEndIndex = indexOf(data, separator, partStartIndex);
+        if(headerEndIndex == -1) return "";
+        return new String(data, partStartIndex, headerEndIndex - partStartIndex);
+    }
+    
+    private static String getFilenameFromHeaders(String headers) {
+        if(headers == null) return null;
+        String[] lines = headers.split("\r\n");
+        for (String line : lines) {
+            if (line.toLowerCase().startsWith("content-disposition:")) {
+                String[] parts = line.split(";");
+                for (String part : parts) {
+                    if (part.trim().startsWith("filename")) {
+                        return part.split("=")[1].replace("\"", "").trim();
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    private static int findBodyStart(byte[] data, int fromIndex) {
+        byte[] separator = new byte[]{13, 10, 13, 10}; 
+        return indexOf(data, separator, fromIndex);
+    }
+    
+    private static int indexOf(byte[] source, byte[] target, int fromIndex) {
+        for (int i = fromIndex; i <= source.length - target.length; i++) {
+            boolean found = true;
+            for (int j = 0; j < target.length; j++) {
+                if (source[i + j] != target[j]) {
+                    found = false;
+                    break;
+                }
+            }
+            if (found) return i;
+        }
+        return -1;
     }
 
     private static void handleDownloadRequest(HttpExchange exchange) throws IOException {
@@ -290,50 +377,39 @@ public class P2PNode {
     }
 
     private static String getMyIp() {
-        // Daftar nama antarmuka yang akan diprioritaskan (Wi-Fi dan Ethernet)
         List<String> priorityInterfaces = Arrays.asList("wlan", "wi-fi", "wireless", "eth");
         try {
-            // Map untuk menyimpan kandidat IP, agar bisa diproses nanti
             Map<String, String> ipCandidates = new HashMap<>();
             Enumeration<NetworkInterface> networkInterfaces = NetworkInterface.getNetworkInterfaces();
             while (networkInterfaces.hasMoreElements()) {
                 NetworkInterface ni = networkInterfaces.nextElement();
-                // Filter: harus aktif dan bukan loopback
                 if (ni.isUp() && !ni.isLoopback()) {
                     Enumeration<InetAddress> inetAddresses = ni.getInetAddresses();
                     while (inetAddresses.hasMoreElements()) {
                         InetAddress inetAddr = inetAddresses.nextElement();
-                        // Filter: harus IPv4 dan bukan alamat link-local
                         if (inetAddr instanceof Inet4Address && !inetAddr.isLinkLocalAddress()) {
-                            // Simpan kandidat IP beserta nama antarmukanya
                             ipCandidates.put(inetAddr.getHostAddress(), ni.getDisplayName().toLowerCase());
                         }
                     }
                 }
             }
 
-            // Proses kandidat dengan logika prioritas
             for (String interfaceNameKey : priorityInterfaces) {
                 for (Map.Entry<String, String> entry : ipCandidates.entrySet()) {
                     if (entry.getValue().contains(interfaceNameKey)) {
-                        logMessage("[INFO] IP dipilih dari antarmuka prioritas ('" + entry.getValue() + "'): " + entry.getKey());
-                        return entry.getKey(); // Kembalikan IP dari antarmuka prioritas
+                        return entry.getKey();
                     }
                 }
             }
 
-            // Jika tidak ada antarmuka prioritas, kembalikan IP valid pertama yang ditemukan
             if (!ipCandidates.isEmpty()) {
-                String fallbackIp = ipCandidates.keySet().iterator().next();
-                logMessage("[WARN] Tidak ada antarmuka prioritas ditemukan. Menggunakan IP pertama yang valid: " + fallbackIp);
-                return fallbackIp;
+                return ipCandidates.keySet().iterator().next();
             }
 
         } catch (SocketException e) {
             logMessage("[ERROR] Tidak bisa mendapatkan alamat IP lokal: " + e.getMessage());
         }
         
-        // Jika tidak ada IP yang cocok sama sekali, kembalikan loopback
         return "127.0.0.1";
     }
     
