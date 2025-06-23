@@ -250,55 +250,82 @@ public class P2PNode {
         sendHttpResponse(exchange, 200, "text/html", response);
     }
 
+    // --- ## PERBAIKAN TOTAL FUNGSI UPLOAD ## ---
     private static void handleUploadRequest(HttpExchange exchange) throws IOException {
         if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
             sendHttpResponse(exchange, 405, "text/plain", "Method Not Allowed");
             return;
         }
+
+        String filename = null;
         try {
             String contentType = exchange.getRequestHeaders().getFirst("Content-Type");
             String boundary = "--" + contentType.split("boundary=")[1];
-            InputStream in = exchange.getRequestBody();
-            byte[] data = in.readAllBytes();
             
-            String rawFilename = getFilenameFromHeaders(getHeaders(data, 0));
-            if (rawFilename != null && !rawFilename.isEmpty()) {
-                String cleanFilename = Paths.get(rawFilename).getFileName().toString();
-                int fileDataStartIndex = findBodyStart(data, 0) + 4;
-                int fileDataEndIndex = indexOf(data, boundary.getBytes(StandardCharsets.UTF_8), fileDataStartIndex);
-                if (fileDataEndIndex == -1) fileDataEndIndex = data.length;
-                if (fileDataEndIndex > 2 && data[fileDataEndIndex - 2] == '\r' && data[fileDataEndIndex - 1] == '\n') {
-                    fileDataEndIndex -= 2;
-                }
-                File outputFile = new File(SHARE_DIR, cleanFilename);
-                try (FileOutputStream fos = new FileOutputStream(outputFile)) {
-                    fos.write(data, fileDataStartIndex, fileDataEndIndex - fileDataStartIndex);
-                }
-                logMessage("File '" + cleanFilename + "' berhasil di-upload dari web.");
-            } else {
-                logMessage("[WARN] Gagal mendapatkan nama file dari upload.");
+            InputStream in = exchange.getRequestBody();
+            byte[] bodyBytes = in.readAllBytes();
+            
+            // Mencari bagian pertama dari data multipart
+            int partStartIndex = indexOf(bodyBytes, boundary.getBytes(StandardCharsets.UTF_8), 0);
+            if(partStartIndex == -1) throw new IOException("Boundary awal tidak ditemukan.");
+            
+            // Mencari header Content-Disposition di dalam bagian pertama
+            String headers = getHeaders(bodyBytes, partStartIndex);
+            filename = getFilenameFromHeaders(headers);
+
+            if (filename == null || filename.isEmpty()) throw new IOException("Nama file tidak ditemukan di header.");
+            
+            // Membersihkan nama file dari informasi path
+            filename = Paths.get(filename).getFileName().toString();
+
+            // Mencari posisi awal data biner file
+            int fileDataStartIndex = findBodyStart(bodyBytes, partStartIndex);
+            if (fileDataStartIndex == -1) throw new IOException("Pemisah header-body tidak ditemukan.");
+            fileDataStartIndex += 4; // Lewati \r\n\r\n
+
+            // Mencari posisi akhir data biner file (sebelum boundary berikutnya)
+            int fileDataEndIndex = indexOf(bodyBytes, boundary.getBytes(StandardCharsets.UTF_8), fileDataStartIndex);
+            if(fileDataEndIndex == -1) fileDataEndIndex = bodyBytes.length;
+            
+            // Menyesuaikan untuk \r\n sebelum boundary
+            if (fileDataEndIndex > 2 && bodyBytes[fileDataEndIndex - 2] == '\r' && bodyBytes[fileDataEndIndex - 1] == '\n') {
+                fileDataEndIndex -= 2;
             }
+
+            File outputFile = new File(SHARE_DIR, filename);
+            try (FileOutputStream fos = new FileOutputStream(outputFile)) {
+                fos.write(bodyBytes, fileDataStartIndex, fileDataEndIndex - fileDataStartIndex);
+            }
+            logMessage("File '" + filename + "' berhasil di-upload dari web.");
+
         } catch (Exception e) {
             logMessage("[ERROR] Gagal saat memproses upload: " + e.getMessage());
+            e.printStackTrace();
         } finally {
             exchange.getResponseHeaders().set("Location", "/");
             exchange.sendResponseHeaders(302, -1);
         }
     }
-
-    private static String getHeaders(byte[] data, int fromIndex) {
+    
+    // Helper baru yang lebih andal untuk upload
+    private static String getHeaders(byte[] data, int partStartIndex) {
         byte[] separator = {13, 10, 13, 10}; // \r\n\r\n
-        int headerEndIndex = indexOf(data, separator, fromIndex);
+        int headerEndIndex = indexOf(data, separator, partStartIndex);
         if(headerEndIndex == -1) return "";
-        int headerStartIndex = indexOf(data, "Content-Disposition".getBytes(), fromIndex);
+        // Kita hanya perlu bagian setelah boundary awal
+        int headerStartIndex = partStartIndex + ("--boundary").length(); // Kira-kira
         return new String(data, headerStartIndex, headerEndIndex - headerStartIndex);
     }
     
     private static String getFilenameFromHeaders(String headers) {
         if(headers == null) return null;
-        for (String part : headers.split(";")) {
-            if (part.trim().startsWith("filename")) {
-                return part.split("=")[1].replace("\"", "").trim();
+        for (String line : headers.split("\r\n")) {
+            if (line.trim().toLowerCase().startsWith("content-disposition:")) {
+                for (String part : line.split(";")) {
+                    if (part.trim().startsWith("filename")) {
+                        return part.split("=")[1].replace("\"", "").trim();
+                    }
+                }
             }
         }
         return null;
@@ -327,6 +354,7 @@ public class P2PNode {
         String query = exchange.getRequestURI().getQuery();
         String filename = URLDecoder.decode(query.split("=")[1], StandardCharsets.UTF_8);
         File file = new File(SHARE_DIR, filename);
+
         if (file.exists()) {
             exchange.getResponseHeaders().set("Content-Disposition", "attachment; filename=\"" + file.getName() + "\"");
             exchange.sendResponseHeaders(200, file.length());
@@ -358,19 +386,14 @@ public class P2PNode {
         }
     }
     
-    // --- ## FUNGSI getMyIp() VERSI FINAL DENGAN LOGIKA PRIORITAS ## ---
     private static String getMyIp() {
-        // Daftar kata kunci untuk antarmuka virtual yang akan diabaikan
-        List<String> ignoredKeywords = Arrays.asList("virtual", "vmnet", "vpn", "loopback");
-        
+        List<String> ignoredKeywords = Arrays.asList("virtual", "vmnet", "vpn", "loopback", "bluetooth");
         try {
-            // Mengambil semua antarmuka jaringan yang ada di komputer
             Enumeration<NetworkInterface> networkInterfaces = NetworkInterface.getNetworkInterfaces();
             while (networkInterfaces.hasMoreElements()) {
                 NetworkInterface ni = networkInterfaces.nextElement();
                 String interfaceName = ni.getDisplayName().toLowerCase();
 
-                // Cek apakah antarmuka ini harus diabaikan
                 boolean shouldBeIgnored = false;
                 for (String keyword : ignoredKeywords) {
                     if (interfaceName.contains(keyword)) {
@@ -379,15 +402,11 @@ public class P2PNode {
                     }
                 }
                 
-                // Jika antarmuka aktif dan TIDAK perlu diabaikan
                 if (ni.isUp() && !ni.isLoopback() && !shouldBeIgnored) {
                     Enumeration<InetAddress> inetAddresses = ni.getInetAddresses();
                     while (inetAddresses.hasMoreElements()) {
                         InetAddress inetAddr = inetAddresses.nextElement();
-                        // Kita cari alamat IPv4 yang valid
                         if (inetAddr instanceof Inet4Address && !inetAddr.isLinkLocalAddress()) {
-                            // Langsung kembalikan IP dari antarmuka fisik pertama yang ditemukan
-                            logMessage("[INFO] IP dipilih dari antarmuka: '" + ni.getDisplayName() + "' -> " + inetAddr.getHostAddress());
                             return inetAddr.getHostAddress();
                         }
                     }
@@ -397,7 +416,6 @@ public class P2PNode {
             logMessage("[ERROR] Tidak bisa mendapatkan alamat IP lokal: " + e.getMessage());
         }
         
-        // Jika tidak ada IP yang cocok sama sekali, kembalikan loopback sebagai fallback terakhir
         logMessage("[WARN] Tidak ada antarmuka jaringan yang cocok ditemukan. Menggunakan 127.0.0.1 sebagai fallback.");
         return "127.0.0.1";
     }
